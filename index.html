@@ -351,6 +351,7 @@
   <div id="signals-section">
     <div class="sig-title">SEÑALES POR INDICADOR</div>
     <div class="sig-list" id="sig-list"></div>
+    <div id="filter-box" style="margin-top:10px"></div>
     <div id="last-update"></div>
     <div id="disclaimer">⚠ Señales orientativas. No son asesoramiento financiero. Opera siempre con Stop Loss y gestión de riesgo.</div>
   </div>
@@ -364,7 +365,7 @@ let currentInterval = "1h";
 let cfg = {
   ema: true,  emaFast: 9,   emaSlow: 21,
   sma: false, smaFast: 10,  smaSlow: 50,
-  rsi: true,  rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70,
+  rsi: false, rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70,
   macd: true,
   bollinger: false, bbPeriod: 20, bbMult: 2,
 };
@@ -544,9 +545,14 @@ async function fetchBinanceData(symbol, interval) {
 
   const closes = klines.map(k => parseFloat(k[4]));
   const price  = closes[closes.length - 1];
+  const candles = klines.map(k => ({
+    high: parseFloat(k[2]), low: parseFloat(k[3]),
+    close: parseFloat(k[4]), vol: parseFloat(k[5]),
+  }));
 
   return {
     closes,
+    candles,
     price,
     change24h:  ticker ? parseFloat(ticker.priceChangePercent) : null,
     high24h:    ticker ? parseFloat(ticker.highPrice) : null,
@@ -595,6 +601,34 @@ function calcBollinger(arr,p=20,mult=2) {
   const m=sl.reduce((a,b)=>a+b,0)/p;
   const std=Math.sqrt(sl.map(v=>(v-m)**2).reduce((a,b)=>a+b,0)/p);
   return {upper:m+mult*std,middle:m,lower:m-mult*std};
+}
+
+// ── ADX (fuerza de tendencia) ──────────────────────────────────────────────────
+function calcADX(candles, p=14) {
+  if (candles.length < p*2) return null;
+  const slice = candles.slice(-(p*2));
+  let plusDM=[], minusDM=[], tr=[];
+  for (let i=1;i<slice.length;i++) {
+    const h=slice[i].high, l=slice[i].low, ph=slice[i-1].high, pl=slice[i-1].low, pc=slice[i-1].close;
+    const up=h-ph, down=pl-l;
+    plusDM.push(up>down&&up>0?up:0);
+    minusDM.push(down>up&&down>0?down:0);
+    tr.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc)));
+  }
+  const sTR=tr.slice(0,p).reduce((a,b)=>a+b,0);
+  const sP=plusDM.slice(0,p).reduce((a,b)=>a+b,0);
+  const sM=minusDM.slice(0,p).reduce((a,b)=>a+b,0);
+  const diP=sP/sTR*100, diM=sM/sTR*100;
+  const dx=Math.abs(diP-diM)/(diP+diM)*100;
+  return { adx:dx, diPlus:diP, diMinus:diM };
+}
+
+// ── Volumen sobre promedio ─────────────────────────────────────────────────────
+function volumeAboveAvg(candles, period=20) {
+  if (candles.length < period) return true;
+  const recent = candles.slice(-period-1, -1).map(c=>c.vol);
+  const avg = recent.reduce((a,b)=>a+b,0)/period;
+  return candles[candles.length-1].vol > avg * 1.1;
 }
 
 function computeSignals(closes, price) {
@@ -741,6 +775,32 @@ function renderResult(data, result) {
 
   document.getElementById("last-update").textContent=
     "Datos reales · Binance · "+new Date().toLocaleTimeString("es");
+
+  // ── ADX + Volume filter warnings ──
+  const filterBox = document.getElementById("filter-box");
+  filterBox.innerHTML = "";
+  const warnings = [];
+
+  if (result.adx) {
+    const adx = result.adx.adx;
+    if (adx < 20) {
+      warnings.push({ color:"#f59e0b", icon:"⚠", text:`Mercado lateral — ADX ${adx.toFixed(1)} (tendencia débil). Mejor esperar señal más clara.` });
+    } else {
+      const dir = result.adx.diPlus > result.adx.diMinus ? "alcista" : "bajista";
+      filterBox.innerHTML += `<div style="background:#00e5a011;border:1px solid #00e5a033;border-radius:7px;padding:9px 13px;font-size:11px;color:#00e5a0;margin-bottom:6px">✓ ADX ${adx.toFixed(1)} — Tendencia ${dir} activa. Señales más confiables.</div>`;
+    }
+  }
+
+  if (!result.volOk) {
+    warnings.push({ color:"#f59e0b", icon:"⚠", text:"Volumen bajo — la señal no está confirmada por movimiento de mercado. Mayor riesgo de señal falsa." });
+  } else {
+    filterBox.innerHTML += `<div style="background:#00e5a011;border:1px solid #00e5a033;border-radius:7px;padding:9px 13px;font-size:11px;color:#00e5a0;margin-bottom:6px">✓ Volumen confirmado — la señal tiene respaldo de mercado.</div>`;
+  }
+
+  warnings.forEach(w => {
+    filterBox.innerHTML += `<div style="background:${w.color}11;border:1px solid ${w.color}44;border-radius:7px;padding:9px 13px;font-size:11px;color:${w.color};margin-bottom:6px">${w.icon} ${w.text}</div>`;
+  });
+
   document.getElementById("disclaimer").style.display="block";
 }
 
@@ -763,6 +823,11 @@ async function go() {
   try {
     const data   = await fetchBinanceData(sym, currentInterval);
     const result = computeSignals(data.closes, data.price);
+    // ADX and volume filters
+    const adxData = calcADX(data.candles);
+    const volOk   = volumeAboveAvg(data.candles);
+    result.adx    = adxData;
+    result.volOk  = volOk;
     document.getElementById("loading-box").style.display="none";
     renderResult(data, result);
   } catch(e) {
